@@ -1,0 +1,12 @@
+[package]
+name = "mcagent-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mcagent-mcp = { workspace = true }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

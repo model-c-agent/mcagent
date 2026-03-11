@@ -1,0 +1,29 @@
+[package]
+name = "mcagent-wasi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mcagent-core = { workspace = true }
+mcagent-cowfs = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+# WASI runtime
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+wasmtime-wasi-http = { workspace = true }
+
+# Compilation
+toml = { workspace = true }
+sha1 = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+
+# Preview2 HTTP support
+http-body-util = { workspace = true }
+hyper = { workspace = true }
