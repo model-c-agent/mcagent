@@ -4,6 +4,7 @@ members = [
     "crates/mcagent-core",
     "crates/mcagent-cowfs",
     "crates/mcagent-wasi",
+    "crates/mcagent-docker",
     "crates/mcagent-gitbutler",
     "crates/mcagent-mcp",
     "bin/mcagent-server",
@@ -14,11 +15,16 @@ members = [
 mcagent-core = { path = "crates/mcagent-core" }
 mcagent-cowfs = { path = "crates/mcagent-cowfs" }
 mcagent-wasi = { path = "crates/mcagent-wasi" }
+mcagent-docker = { path = "crates/mcagent-docker" }
 mcagent-gitbutler = { path = "crates/mcagent-gitbutler" }
 mcagent-mcp = { path = "crates/mcagent-mcp" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
 
 # MCP
 rmcp = { version = "1.1", features = ["server", "macros", "schemars", "transport-io", "transport-streamable-http-server"] }

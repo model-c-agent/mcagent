@@ -77,6 +77,7 @@ pub struct AgentConfig {
     pub task_description: String,
     pub branch_name: Option<String>,
     pub stacked_on: Option<String>,
+    pub budget: Option<crate::budget::Budget>,
 }
 
 /// Current state of an agent.

@@ -1,11 +1,13 @@
 [package]
-name = "mcagent-core"
+name = "mcagent-docker"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 async-trait = { workspace = true }
+mcagent-core = { workspace = true }
+mcagent-cowfs = { workspace = true }
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-uuid = { workspace = true }
+tracing = { workspace = true }

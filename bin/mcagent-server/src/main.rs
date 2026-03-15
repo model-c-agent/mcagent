@@ -1,12 +1,26 @@
 use anyhow::Result;
+use clap::Parser;
 use mcagent_mcp::McAgentServer;
+use mcagent_docker::DockerBackend;
+use mcagent_wasi::WasiBackend;
 use rmcp::ServiceExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::{self, EnvFilter};
+
+#[derive(Parser)]
+#[command(name = "mcagent-server", about = "mcagent MCP server")]
+struct Args {
+    /// Project root directory (defaults to current directory)
+    project_root: Option<PathBuf>,
+
+    /// Execution backend: wasi, docker, or k8s
+    #[arg(long, default_value = "wasi")]
+    backend: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing (logs to stderr so stdout is free for MCP stdio transport)
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -14,23 +28,32 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Determine project root from args or current directory
-    let project_root = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
+    let args = Args::parse();
+
+    let project_root = args
+        .project_root
         .unwrap_or_else(|| std::env::current_dir().expect("failed to get current directory"));
+
+    let backend: Arc<dyn mcagent_core::ExecutionBackend> = match args.backend.as_str() {
+        "wasi" => Arc::new(WasiBackend::new(&project_root)),
+        "docker" => Arc::new(DockerBackend::new(&project_root)),
+        "k8s" => {
+            anyhow::bail!("k8s backend not yet implemented — use --backend wasi or docker");
+        }
+        other => {
+            anyhow::bail!("unknown backend '{}' — supported: wasi, docker, k8s", other);
+        }
+    };
 
     tracing::info!(
         project_root = %project_root.display(),
+        backend = %args.backend,
         "starting mcagent MCP server"
     );
 
-    let server = McAgentServer::new(project_root);
+    let server = McAgentServer::new(project_root, backend);
 
-    // Serve over stdio transport
     let service = server.serve(rmcp::transport::stdio()).await?;
-
-    // Wait for the service to complete
     service.waiting().await?;
 
     Ok(())

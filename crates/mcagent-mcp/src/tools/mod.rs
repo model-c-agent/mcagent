@@ -20,6 +20,16 @@ struct AgentCreateParams {
     task_description: String,
     branch_name: Option<String>,
     stacked_on: Option<String>,
+    /// Optional budget: max input tokens
+    budget_token_input: Option<u64>,
+    /// Optional budget: max output tokens
+    budget_token_output: Option<u64>,
+    /// Optional budget: max API calls
+    budget_api_calls: Option<u64>,
+    /// Optional budget: max wall-clock seconds
+    budget_wall_clock_seconds: Option<u64>,
+    /// Optional budget: max work hours (composite unit)
+    budget_work_hours: Option<f64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -91,6 +101,35 @@ struct CreatePrParams {
     description: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct SetBudgetParams {
+    agent_id: String,
+    token_input_limit: Option<u64>,
+    token_output_limit: Option<u64>,
+    cpu_seconds: Option<f64>,
+    memory_mb_seconds: Option<f64>,
+    wall_clock_seconds: Option<u64>,
+    api_calls: Option<u64>,
+    work_hours: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct EstimateTaskBudgetParams {
+    task_description: String,
+    /// Complexity level: "low", "medium", or "high"
+    complexity: Option<String>,
+}
+
+// === Helper: error result ===
+
+fn err(msg: String) -> Result<CallToolResult, rmcp::ErrorData> {
+    Ok(CallToolResult::error(vec![rmcp::model::Content::text(msg)]))
+}
+
+fn ok(msg: String) -> Result<CallToolResult, rmcp::ErrorData> {
+    Ok(CallToolResult::success(vec![rmcp::model::Content::text(msg)]))
+}
+
 // === Tool implementations ===
 
 #[rmcp::tool_router(vis = "pub(crate)")]
@@ -106,24 +145,16 @@ impl McAgentServer {
         let mcagent_dir = std::path::Path::new(&params.project_path).join(".mcagent");
 
         if let Err(e) = std::fs::create_dir_all(mcagent_dir.join("agents")) {
-            return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                format!("Failed to create .mcagent directory: {e}"),
-            )]));
+            return err(format!("Failed to create .mcagent directory: {e}"));
         }
         if let Err(e) = std::fs::create_dir_all(mcagent_dir.join("tools")) {
-            return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                format!("Failed to create tools directory: {e}"),
-            )]));
+            return err(format!("Failed to create tools directory: {e}"));
         }
         if let Err(e) = std::fs::create_dir_all(mcagent_dir.join("cache/wasi")) {
-            return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                format!("Failed to create cache directory: {e}"),
-            )]));
+            return err(format!("Failed to create cache directory: {e}"));
         }
 
-        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            format!("Workspace initialized at {}", state.project_root.display()),
-        )]))
+        ok(format!("Workspace initialized at {}", state.project_root.display()))
     }
 
     #[tool(description = "Get the status of the mcagent workspace, including all active agents and branches.")]
@@ -133,9 +164,14 @@ impl McAgentServer {
             .agents
             .values()
             .map(|a| {
+                let budget_info = if let Some(usage) = state.budget_usage.get(&a.id.to_string()) {
+                    format!(", api_calls={}", usage.api_calls_used)
+                } else {
+                    String::new()
+                };
                 format!(
-                    "  {} ({}): branch={}, state={}",
-                    a.id, a.config.name, a.branch_name, a.state
+                    "  {} ({}): branch={}, state={}{}",
+                    a.id, a.config.name, a.branch_name, a.state, budget_info
                 )
             })
             .collect();
@@ -150,26 +186,46 @@ impl McAgentServer {
             )
         };
 
-        Ok(CallToolResult::success(vec![rmcp::model::Content::text(msg)]))
+        ok(msg)
     }
 
     // --- Agent Lifecycle ---
 
-    #[tool(description = "Create a new isolated agent with its own COW filesystem copy and GitButler branch.")]
+    #[tool(description = "Create a new isolated agent with its own filesystem copy and GitButler branch. Supports optional budget constraints.")]
     async fn agent_create(
         &self,
         Parameters(params): Parameters<AgentCreateParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut state = self.state.write().await;
 
+        let budget = if params.budget_token_input.is_some()
+            || params.budget_token_output.is_some()
+            || params.budget_api_calls.is_some()
+            || params.budget_wall_clock_seconds.is_some()
+            || params.budget_work_hours.is_some()
+        {
+            Some(mcagent_core::Budget {
+                token_input_limit: params.budget_token_input,
+                token_output_limit: params.budget_token_output,
+                cpu_seconds: None,
+                memory_mb_seconds: None,
+                wall_clock_seconds: params.budget_wall_clock_seconds,
+                api_calls: params.budget_api_calls,
+                work_hours: params.budget_work_hours,
+            })
+        } else {
+            None
+        };
+
         let config = AgentConfig {
             name: params.name,
             task_description: params.task_description,
             branch_name: params.branch_name,
             stacked_on: params.stacked_on.clone(),
+            budget,
         };
 
-        match state.create_agent(config) {
+        match state.create_agent(config).await {
             Ok(agent) => {
                 let branch_result = if let Some(parent) = &params.stacked_on {
                     state.gitbutler.create_stacked_branch(&agent.branch_name, parent).await
@@ -181,16 +237,12 @@ impl McAgentServer {
                     tracing::warn!("Failed to create GitButler branch (continuing): {e}");
                 }
 
-                Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                    format!(
-                        "Agent created:\n  id: {}\n  name: {}\n  branch: {}\n  working_dir: {}",
-                        agent.id, agent.config.name, agent.branch_name, agent.working_dir.display()
-                    ),
-                )]))
+                ok(format!(
+                    "Agent created:\n  id: {}\n  name: {}\n  branch: {}\n  working_dir: {}",
+                    agent.id, agent.config.name, agent.branch_name, agent.working_dir.display()
+                ))
             }
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                format!("Failed to create agent: {e}"),
-            )])),
+            Err(e) => err(format!("Failed to create agent: {e}")),
         }
     }
 
@@ -203,8 +255,8 @@ impl McAgentServer {
 
         match state.get_agent(&params.agent_id) {
             Ok(agent) => {
-                let diff_info = if let Some(cow) = state.cow_layers.get(&params.agent_id) {
-                    match cow.diff() {
+                let diff_info = if let Some(handle) = state.handles.get(&params.agent_id) {
+                    match state.backend.diff(handle).await {
                         Ok(diffs) if diffs.is_empty() => "  No changes".to_string(),
                         Ok(diffs) => diffs
                             .iter()
@@ -214,32 +266,38 @@ impl McAgentServer {
                         Err(e) => format!("  Error computing diff: {e}"),
                     }
                 } else {
-                    "  COW layer not found".to_string()
+                    "  Isolation handle not found".to_string()
                 };
 
-                Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                    format!(
-                        "Agent {}:\n  name: {}\n  state: {}\n  branch: {}\n  task: {}\nChanges:\n{}",
-                        agent.id, agent.config.name, agent.state, agent.branch_name,
-                        agent.config.task_description, diff_info
-                    ),
-                )]))
+                let budget_info = if let (Some(budget), Some(usage)) = (
+                    state.budgets.get(&params.agent_id),
+                    state.budget_usage.get(&params.agent_id),
+                ) {
+                    let status = mcagent_core::check_budget(budget, usage);
+                    format!("\nBudget: {:?}\nUsage: api_calls={}, work_hours={:.2}", status, usage.api_calls_used, usage.compute_work_hours())
+                } else {
+                    String::new()
+                };
+
+                ok(format!(
+                    "Agent {}:\n  name: {}\n  state: {}\n  branch: {}\n  task: {}\nChanges:\n{}{}",
+                    agent.id, agent.config.name, agent.state, agent.branch_name,
+                    agent.config.task_description, diff_info, budget_info
+                ))
             }
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Err(e) => err(format!("{e}")),
         }
     }
 
-    #[tool(description = "Destroy an agent, removing its COW filesystem layer.")]
+    #[tool(description = "Destroy an agent, removing its isolation layer.")]
     async fn agent_destroy(
         &self,
         Parameters(params): Parameters<AgentIdParam>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut state = self.state.write().await;
-        match state.destroy_agent(&params.agent_id) {
-            Ok(()) => Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                format!("Agent {} destroyed.", params.agent_id),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+        match state.destroy_agent(&params.agent_id).await {
+            Ok(()) => ok(format!("Agent {} destroyed.", params.agent_id)),
+            Err(e) => err(format!("{e}")),
         }
     }
 
@@ -250,56 +308,58 @@ impl McAgentServer {
         &self,
         Parameters(params): Parameters<ReadFileParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        if let Err(e) = state.enforce_budget(&params.agent_id) {
+            return err(format!("{e}"));
+        }
+        state.record_api_call(&params.agent_id);
+
         let agent = match state.get_agent(&params.agent_id) {
-            Ok(a) => a,
-            Err(e) => return Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Ok(a) => a.clone(),
+            Err(e) => return err(format!("{e}")),
         };
 
         let file_path = agent.working_dir.join(&params.path);
         if !file_path.starts_with(&agent.working_dir) {
-            return Ok(CallToolResult::error(vec![rmcp::model::Content::text("Path traversal not allowed".to_string())]));
+            return err("Path traversal not allowed".to_string());
         }
 
         match std::fs::read_to_string(&file_path) {
-            Ok(content) => Ok(CallToolResult::success(vec![rmcp::model::Content::text(content)])),
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                format!("Failed to read {}: {e}", params.path),
-            )])),
+            Ok(content) => ok(content),
+            Err(e) => err(format!("Failed to read {}: {e}", params.path)),
         }
     }
 
-    #[tool(description = "Write a file to an agent's isolated filesystem copy (COW layer).")]
+    #[tool(description = "Write a file to an agent's isolated filesystem copy.")]
     async fn write_file(
         &self,
         Parameters(params): Parameters<WriteFileParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        if let Err(e) = state.enforce_budget(&params.agent_id) {
+            return err(format!("{e}"));
+        }
+        state.record_api_call(&params.agent_id);
+
         let agent = match state.get_agent(&params.agent_id) {
-            Ok(a) => a,
-            Err(e) => return Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Ok(a) => a.clone(),
+            Err(e) => return err(format!("{e}")),
         };
 
         let file_path = agent.working_dir.join(&params.path);
         if !file_path.starts_with(&agent.working_dir) {
-            return Ok(CallToolResult::error(vec![rmcp::model::Content::text("Path traversal not allowed".to_string())]));
+            return err("Path traversal not allowed".to_string());
         }
 
         if let Some(parent) = file_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                    format!("Failed to create directory: {e}"),
-                )]));
+                return err(format!("Failed to create directory: {e}"));
             }
         }
 
         match std::fs::write(&file_path, &params.content) {
-            Ok(()) => Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                format!("Written {} bytes to {}", params.content.len(), params.path),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                format!("Failed to write {}: {e}", params.path),
-            )])),
+            Ok(()) => ok(format!("Written {} bytes to {}", params.content.len(), params.path)),
+            Err(e) => err(format!("Failed to write {}: {e}", params.path)),
         }
     }
 
@@ -308,10 +368,15 @@ impl McAgentServer {
         &self,
         Parameters(params): Parameters<ListDirParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        if let Err(e) = state.enforce_budget(&params.agent_id) {
+            return err(format!("{e}"));
+        }
+        state.record_api_call(&params.agent_id);
+
         let agent = match state.get_agent(&params.agent_id) {
-            Ok(a) => a,
-            Err(e) => return Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Ok(a) => a.clone(),
+            Err(e) => return err(format!("{e}")),
         };
 
         let dir_path = match &params.path {
@@ -320,7 +385,7 @@ impl McAgentServer {
         };
 
         if !dir_path.starts_with(&agent.working_dir) {
-            return Ok(CallToolResult::error(vec![rmcp::model::Content::text("Path traversal not allowed".to_string())]));
+            return err("Path traversal not allowed".to_string());
         }
 
         match std::fs::read_dir(&dir_path) {
@@ -331,11 +396,9 @@ impl McAgentServer {
                     let kind = if entry.file_type().map_or(false, |ft| ft.is_dir()) { "dir" } else { "file" };
                     lines.push(format!("  {kind}  {name}"));
                 }
-                Ok(CallToolResult::success(vec![rmcp::model::Content::text(lines.join("\n"))]))
+                ok(lines.join("\n"))
             }
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                format!("Failed to list directory: {e}"),
-            )])),
+            Err(e) => err(format!("Failed to list directory: {e}")),
         }
     }
 
@@ -344,10 +407,15 @@ impl McAgentServer {
         &self,
         Parameters(params): Parameters<SearchFilesParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        if let Err(e) = state.enforce_budget(&params.agent_id) {
+            return err(format!("{e}"));
+        }
+        state.record_api_call(&params.agent_id);
+
         let agent = match state.get_agent(&params.agent_id) {
-            Ok(a) => a,
-            Err(e) => return Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Ok(a) => a.clone(),
+            Err(e) => return err(format!("{e}")),
         };
 
         let search_path = match &params.path {
@@ -356,16 +424,16 @@ impl McAgentServer {
         };
 
         if !search_path.starts_with(&agent.working_dir) {
-            return Ok(CallToolResult::error(vec![rmcp::model::Content::text("Path traversal not allowed".to_string())]));
+            return err("Path traversal not allowed".to_string());
         }
 
         let mut matches = Vec::new();
         search_recursive(&search_path, &agent.working_dir, &params.pattern, &mut matches);
 
         if matches.is_empty() {
-            Ok(CallToolResult::success(vec![rmcp::model::Content::text("No matches found.".to_string())]))
+            ok("No matches found.".to_string())
         } else {
-            Ok(CallToolResult::success(vec![rmcp::model::Content::text(matches.join("\n"))]))
+            ok(matches.join("\n"))
         }
     }
 
@@ -376,16 +444,21 @@ impl McAgentServer {
         &self,
         Parameters(params): Parameters<RunToolParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        if let Err(e) = state.enforce_budget(&params.agent_id) {
+            return err(format!("{e}"));
+        }
+        state.record_api_call(&params.agent_id);
+
         let agent = match state.get_agent(&params.agent_id) {
-            Ok(a) => a,
-            Err(e) => return Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Ok(a) => a.clone(),
+            Err(e) => return err(format!("{e}")),
         };
 
         let args = params.args.unwrap_or_default();
         match state.wasi_runner.run_tool(&params.tool_name, &agent.working_dir, &args).await {
-            Ok(output) => Ok(CallToolResult::success(vec![rmcp::model::Content::text(output.stdout)])),
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Ok(output) => ok(output.stdout),
+            Err(e) => err(format!("{e}")),
         }
     }
 
@@ -396,10 +469,8 @@ impl McAgentServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let state = self.state.read().await;
         match state.wasi_runner.compile_tool(std::path::Path::new(&params.source_path)) {
-            Ok(wasm_path) => Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                format!("Compiled to {}", wasm_path.display()),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Ok(wasm_path) => ok(format!("Compiled to {}", wasm_path.display())),
+            Err(e) => err(format!("{e}")),
         }
     }
 
@@ -407,9 +478,7 @@ impl McAgentServer {
     async fn list_wasi_tools(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let state = self.state.read().await;
         match state.wasi_runner.list_source_tools() {
-            Ok(tools) if tools.is_empty() => Ok(CallToolResult::success(vec![
-                rmcp::model::Content::text("No tools available. Use create_tool to write a new tool.".to_string()),
-            ])),
+            Ok(tools) if tools.is_empty() => ok("No tools available. Use create_tool to write a new tool.".to_string()),
             Ok(tools) => {
                 let mut lines = Vec::new();
                 for path in &tools {
@@ -427,11 +496,9 @@ impl McAgentServer {
                     };
                     lines.push(format!("  {meta_info}"));
                 }
-                Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                    format!("Available tools:\n{}", lines.join("\n")),
-                )]))
+                ok(format!("Available tools:\n{}", lines.join("\n")))
             }
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Err(e) => err(format!("{e}")),
         }
     }
 
@@ -442,51 +509,50 @@ impl McAgentServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let state = self.state.read().await;
         match state.wasi_runner.create_tool(&params.name, &params.source) {
-            Ok(source_path) => Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                format!("Tool '{}' created and compiled: {}", params.name, source_path.display()),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Ok(source_path) => ok(format!("Tool '{}' created and compiled: {}", params.name, source_path.display())),
+            Err(e) => err(format!("{e}")),
         }
     }
 
     // --- Git/GitButler ---
 
-    #[tool(description = "Commit an agent's changed files to its GitButler branch. Diffs the COW layer and commits only modified files.")]
+    #[tool(description = "Commit an agent's changed files to its GitButler branch.")]
     async fn commit_changes(
         &self,
         Parameters(params): Parameters<CommitParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        if let Err(e) = state.enforce_budget(&params.agent_id) {
+            return err(format!("{e}"));
+        }
+        state.record_api_call(&params.agent_id);
+
         let agent = match state.get_agent(&params.agent_id) {
-            Ok(a) => a,
-            Err(e) => return Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Ok(a) => a.clone(),
+            Err(e) => return err(format!("{e}")),
         };
 
-        let diffs = match state.cow_layers.get(&params.agent_id) {
-            Some(cow) => match cow.diff() {
+        let diffs = match state.handles.get(&params.agent_id) {
+            Some(handle) => match state.backend.diff(handle).await {
                 Ok(d) => d,
-                Err(e) => return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                    format!("Failed to compute diff: {e}"),
-                )])),
+                Err(e) => return err(format!("Failed to compute diff: {e}")),
             },
-            None => return Ok(CallToolResult::error(vec![rmcp::model::Content::text("COW layer not found".to_string())])),
+            None => return err("Isolation handle not found".to_string()),
         };
 
         if diffs.is_empty() {
-            return Ok(CallToolResult::success(vec![rmcp::model::Content::text("No changes to commit.".to_string())]));
+            return ok("No changes to commit.".to_string());
         }
 
         let file_paths: Vec<String> = diffs.iter().map(|d| d.path.display().to_string()).collect();
         let file_refs: Vec<&str> = file_paths.iter().map(|s| s.as_str()).collect();
 
         match state.gitbutler.commit(&params.message, &file_refs).await {
-            Ok(info) => Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                format!(
-                    "Committed {} files to branch '{}':\n  commit: {}\n  files: {}",
-                    diffs.len(), agent.branch_name, info.id, file_paths.join(", ")
-                ),
-            )])),
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("Failed to commit: {e}"))])),
+            Ok(info) => ok(format!(
+                "Committed {} files to branch '{}':\n  commit: {}\n  files: {}",
+                diffs.len(), agent.branch_name, info.id, file_paths.join(", ")
+            )),
+            Err(e) => err(format!("Failed to commit: {e}")),
         }
     }
 
@@ -510,9 +576,9 @@ impl McAgentServer {
                 } else {
                     format!("Branch '{}' created", info.name)
                 };
-                Ok(CallToolResult::success(vec![rmcp::model::Content::text(msg)]))
+                ok(msg)
             }
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("Failed to create branch: {e}"))])),
+            Err(e) => err(format!("Failed to create branch: {e}")),
         }
     }
 
@@ -521,21 +587,25 @@ impl McAgentServer {
         &self,
         Parameters(params): Parameters<CreatePrParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let state = self.state.read().await;
+        let mut state = self.state.write().await;
+        if let Err(e) = state.enforce_budget(&params.agent_id) {
+            return err(format!("{e}"));
+        }
+        state.record_api_call(&params.agent_id);
+
         let agent = match state.get_agent(&params.agent_id) {
-            Ok(a) => a,
-            Err(e) => return Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("{e}"))])),
+            Ok(a) => a.clone(),
+            Err(e) => return err(format!("{e}")),
         };
 
         if let Err(e) = state.gitbutler.push(&agent.branch_name).await {
-            return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                format!("Failed to push branch: {e}"),
-            )]));
+            return err(format!("Failed to push branch: {e}"));
         }
 
-        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            format!("Branch '{}' pushed.\nPR: title={}, description={}", agent.branch_name, params.title, params.description),
-        )]))
+        ok(format!(
+            "Branch '{}' pushed.\nPR: title={}, description={}",
+            agent.branch_name, params.title, params.description
+        ))
     }
 
     #[tool(description = "List all branches in the GitButler workspace.")]
@@ -543,7 +613,7 @@ impl McAgentServer {
         let state = self.state.read().await;
         match state.gitbutler.list_branches().await {
             Ok(branches) if branches.is_empty() => {
-                Ok(CallToolResult::success(vec![rmcp::model::Content::text("No branches in workspace.".to_string())]))
+                ok("No branches in workspace.".to_string())
             }
             Ok(branches) => {
                 let lines: Vec<_> = branches.iter().map(|b| {
@@ -553,12 +623,109 @@ impl McAgentServer {
                         format!("  {}", b.name)
                     }
                 }).collect();
-                Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                    format!("Branches:\n{}", lines.join("\n")),
-                )]))
+                ok(format!("Branches:\n{}", lines.join("\n")))
             }
-            Err(e) => Ok(CallToolResult::error(vec![rmcp::model::Content::text(format!("Failed to list branches: {e}"))])),
+            Err(e) => err(format!("Failed to list branches: {e}")),
         }
+    }
+
+    // --- Budget Management ---
+
+    #[tool(description = "Set or update budget constraints for an agent. Controls token usage, API calls, compute time, and work hours.")]
+    async fn set_budget(
+        &self,
+        Parameters(params): Parameters<SetBudgetParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let mut state = self.state.write().await;
+
+        if state.get_agent(&params.agent_id).is_err() {
+            return err(format!("Agent not found: {}", params.agent_id));
+        }
+
+        let budget = mcagent_core::Budget {
+            token_input_limit: params.token_input_limit,
+            token_output_limit: params.token_output_limit,
+            cpu_seconds: params.cpu_seconds,
+            memory_mb_seconds: params.memory_mb_seconds,
+            wall_clock_seconds: params.wall_clock_seconds,
+            api_calls: params.api_calls,
+            work_hours: params.work_hours,
+        };
+
+        state.budgets.insert(params.agent_id.clone(), budget);
+        state
+            .budget_usage
+            .entry(params.agent_id.clone())
+            .or_insert_with(mcagent_core::BudgetUsage::default);
+
+        ok(format!("Budget set for agent {}", params.agent_id))
+    }
+
+    #[tool(description = "Get current budget usage and status for an agent. Shows consumption across all budget dimensions.")]
+    async fn get_budget_usage(
+        &self,
+        Parameters(params): Parameters<AgentIdParam>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let state = self.state.read().await;
+
+        if state.get_agent(&params.agent_id).is_err() {
+            return err(format!("Agent not found: {}", params.agent_id));
+        }
+
+        let budget = state.budgets.get(&params.agent_id);
+        let usage = state.budget_usage.get(&params.agent_id);
+
+        match (budget, usage) {
+            (Some(budget), Some(usage)) => {
+                let status = mcagent_core::check_budget(budget, usage);
+                let remaining_api = budget
+                    .api_calls
+                    .map(|l| format!("{}", l.saturating_sub(usage.api_calls_used)))
+                    .unwrap_or_else(|| "unlimited".to_string());
+                let remaining_input = budget
+                    .token_input_limit
+                    .map(|l| format!("{}", l.saturating_sub(usage.input_tokens_used)))
+                    .unwrap_or_else(|| "unlimited".to_string());
+
+                ok(format!(
+                    "Budget usage for agent {}:\n  status: {:?}\n  api_calls: {}/{}\n  input_tokens: {}/{}\n  output_tokens: {}/{}\n  work_hours: {:.2}/{}\n  remaining_api_calls: {}\n  remaining_input_tokens: {}",
+                    params.agent_id,
+                    status,
+                    usage.api_calls_used,
+                    budget.api_calls.map(|l| l.to_string()).unwrap_or_else(|| "unlimited".to_string()),
+                    usage.input_tokens_used,
+                    budget.token_input_limit.map(|l| l.to_string()).unwrap_or_else(|| "unlimited".to_string()),
+                    usage.output_tokens_used,
+                    budget.token_output_limit.map(|l| l.to_string()).unwrap_or_else(|| "unlimited".to_string()),
+                    usage.compute_work_hours(),
+                    budget.work_hours.map(|l| format!("{:.2}", l)).unwrap_or_else(|| "unlimited".to_string()),
+                    remaining_api,
+                    remaining_input,
+                ))
+            }
+            _ => ok(format!("No budget set for agent {}", params.agent_id)),
+        }
+    }
+
+    #[tool(description = "Estimate a budget for a task based on complexity. Returns suggested limits for planning. Complexity: low, medium, high.")]
+    async fn estimate_task_budget(
+        &self,
+        Parameters(params): Parameters<EstimateTaskBudgetParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let complexity = params.complexity.as_deref().unwrap_or("medium");
+        let budget = mcagent_core::estimate_task_budget(complexity);
+
+        ok(format!(
+            "Estimated budget for '{}' (complexity={}):\n  token_input_limit: {}\n  token_output_limit: {}\n  api_calls: {}\n  wall_clock_seconds: {}\n  work_hours: {}\n  cpu_seconds: {}",
+            params.task_description,
+            complexity,
+            budget.token_input_limit.unwrap_or(0),
+            budget.token_output_limit.unwrap_or(0),
+            budget.api_calls.unwrap_or(0),
+            budget.wall_clock_seconds.unwrap_or(0),
+            budget.work_hours.unwrap_or(0.0),
+            budget.cpu_seconds.unwrap_or(0.0),
+        ))
     }
 }
 

@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+mcagent-core = { workspace = true }
 mcagent-mcp = { workspace = true }
+mcagent-wasi = { workspace = true }
+mcagent-docker = { workspace = true }
 rmcp = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }

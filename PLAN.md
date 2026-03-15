@@ -1,68 +1,68 @@
-# Implementation Plan
+# mcagent — Implementation Plan
 
-## Phase 1: Foundation (Current)
+## Goal 1: Root Agent Definition
 
-### Crate Structure
+Create `.mcagent/agents/mcagent/AGENT.md` — the root orchestrator agent that other projects install as their entry point. This agent definition tells an LLM how to use the mcagent MCP tools to decompose work, spawn isolated sub-agents, and produce stacked PRs.
 
-```
-mcagent/
-  Cargo.toml                    # workspace root
-  crates/
-    mcagent-core/               # shared types, errors, config
-    mcagent-cowfs/              # COW filesystem (APFS reflink, diffing)
-    mcagent-wasi/               # wasmtime WASI sandbox + tool compiler
-    mcagent-gitbutler/          # async wrapper around `but` CLI
-    mcagent-mcp/                # rmcp MCP server
-  tools/                        # built-in WASI tools (single Rust files)
-  bin/
-    mcagent-server/             # main binary (stdio + SSE)
-```
+### Deliverable
 
-### Dependency Graph
+- `.mcagent/agents/mcagent/AGENT.md` — self-contained agent prompt with:
+  - Identity and role (workspace orchestrator)
+  - Available MCP tools (all 17) with usage patterns
+  - Workflow: task decomposition → agent creation → parallel execution → commit → PR
+  - Rules for branch naming, stacking, and COW lifecycle
+  - WASI tool management instructions
+  - Error handling and recovery patterns
 
-```
-mcagent-core         (no internal deps)
-mcagent-cowfs        → mcagent-core
-mcagent-wasi         → mcagent-core, mcagent-cowfs
-mcagent-gitbutler    → mcagent-core
-mcagent-mcp          → all crates
-bin/mcagent-server   → mcagent-mcp
+### How other projects use it
+
+```bash
+# Add mcagent as MCP server
+claude mcp add mcagent -- cargo run --manifest-path /path/to/mcagent/Cargo.toml --bin mcagent-server -- .
+
+# The AGENT.md is loaded by the MCP server or referenced as system prompt
 ```
 
-### Milestones
+## Goal 2: Agent Discovery & Loading
 
-1. **Core types** — `AgentId`, `TaskId`, `AgentConfig`, `AgentState`, error types
-2. **COW filesystem** — `CowLayer` using `reflink-copy`, diff computation, cleanup
-3. **GitButler wrapper** — Typed async CLI wrapper, branch/commit/PR operations
-4. **MCP server** — rmcp server with all tools, stdio + SSE transport
-5. **Integration** — Wire real implementations into MCP tool handlers
+Teach the MCP server to read `.mcagent/agents/*/AGENT.md` files and expose them as agent templates via a new `list_agent_templates` tool. This lets the orchestrator spawn typed sub-agents with predefined behavior.
 
-### MCP Tools
+### Deliverables
 
-**Workspace**: `workspace_init`, `workspace_status`
-**Agents**: `agent_create`, `agent_destroy`, `agent_status`
-**Filesystem**: `read_file`, `write_file`, `list_directory`, `search_files`
-**WASI**: `run_tool`, `compile_tool`, `create_tool`, `list_tools`
-**Git**: `commit_changes`, `create_branch`, `create_pr`, `list_branches`
+- New MCP tool: `list_agent_templates` — scans `.mcagent/agents/` for AGENT.md files
+- New MCP tool: `get_agent_template` — returns the AGENT.md content for a named template
+- Update `workspace_init` to copy bundled agent templates into `.mcagent/agents/`
 
-## Phase 2: WASI Runtime
+## Goal 3: Built-in WASI Tools
 
-- wasmtime engine with module caching
-- Per-agent sandbox: WasiCtx with preopened COW directories
-- Tool compiler: single-file Rust (cargo-script format) → wasm32-wasip2
-- Built-in tools: `read_file.rs`, `write_file.rs`, `list_dir.rs`, `compile_check.rs`
-- Network control: no `wasi:sockets` by default, opt-in `wasi:http` with host allowlist
+Ship a set of foundational WASI tools that every agent gets out of the box.
 
-## Phase 3: Orchestration
+### Deliverables
 
-- Task management with dependency tracking
-- Agent lifecycle: Created → Working → Checkpointing → Completing → Done
-- Stacked branch support for dependent tasks
-- Automatic PR ordering based on task dependencies
+- `tools/read_file.rs` — read with line numbers
+- `tools/write_file.rs` — atomic write with backup
+- `tools/list_dir.rs` — recursive directory listing
+- `tools/compile_check.rs` — run `cargo check` and return diagnostics
+- `tools/test_runner.rs` — run `cargo test` with filtered output
 
-## Phase 4: Agent-Authored Tools
+## Goal 4: Task Orchestration
 
-- Agents write new `.rs` tool files within their sandbox
-- Compile to WASM via the tool compiler
-- Register in tool registry for use by all agents
-- Tool metadata: name, description, required capabilities
+Add task dependency tracking so the orchestrator can express "task B depends on task A" and the system handles ordering, stacked branches, and PR sequencing automatically.
+
+### Deliverables
+
+- `TaskGraph` in `mcagent-core` — DAG of tasks with dependency edges
+- New MCP tools: `create_task`, `add_dependency`, `get_task_order`
+- Automatic stacked branch creation based on dependency edges
+- PR creation respects dependency ordering
+
+## Goal 5: End-to-End Integration
+
+Wire everything together so a single high-level instruction ("implement these 5 features") produces parallel agents, stacked PRs, and a reviewable PR chain.
+
+### Deliverables
+
+- `orchestrate` MCP tool — accepts a list of tasks, builds the graph, spawns agents
+- Progress tracking via `workspace_status`
+- Conflict detection when COW layers overlap on the same files
+- Cleanup: destroy COW layers and branches for completed agents

@@ -34,6 +34,17 @@ pub enum McAgentError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 
+    #[error("budget exceeded for agent {agent_id}: {dimension} (limit={limit}, used={used})")]
+    BudgetExceeded {
+        agent_id: AgentId,
+        dimension: String,
+        limit: f64,
+        used: f64,
+    },
+
+    #[error("docker error: {0}")]
+    Docker(String),
+
     #[error("{0}")]
     Other(String),
 }
