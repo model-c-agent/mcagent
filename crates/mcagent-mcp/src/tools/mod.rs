@@ -130,6 +130,49 @@ fn ok(msg: String) -> Result<CallToolResult, rmcp::ErrorData> {
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(msg)]))
 }
 
+/// Canonicalize `target` and verify it is within `sandbox_root`.
+/// Returns the canonical path on success, or an error string.
+fn check_sandbox_path(
+    target: &std::path::Path,
+    sandbox_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let canonical_root = sandbox_root
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve sandbox root: {e}"))?;
+    let canonical_target = target
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve path '{}': {e}", target.display()))?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err("Path traversal not allowed: resolved path is outside sandbox".to_string());
+    }
+    Ok(canonical_target)
+}
+
+/// For write_file: the target file may not exist yet, so canonicalize
+/// the parent directory instead and verify it is within `sandbox_root`.
+fn check_sandbox_path_for_write(
+    target: &std::path::Path,
+    sandbox_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let canonical_root = sandbox_root
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve sandbox root: {e}"))?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Path has no parent directory".to_string())?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve parent directory '{}': {e}", parent.display()))?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err("Path traversal not allowed: resolved path is outside sandbox".to_string());
+    }
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| "Path has no file name".to_string())?;
+    Ok(canonical_parent.join(file_name))
+}
+
+
 // === Tool implementations ===
 
 #[rmcp::tool_router(vis = "pub(crate)")]
@@ -320,8 +363,8 @@ impl McAgentServer {
         };
 
         let file_path = agent.working_dir.join(&params.path);
-        if !file_path.starts_with(&agent.working_dir) {
-            return err("Path traversal not allowed".to_string());
+        if let Err(msg) = check_sandbox_path(&file_path, &agent.working_dir) {
+            return err(msg);
         }
 
         match std::fs::read_to_string(&file_path) {
@@ -347,14 +390,14 @@ impl McAgentServer {
         };
 
         let file_path = agent.working_dir.join(&params.path);
-        if !file_path.starts_with(&agent.working_dir) {
-            return err("Path traversal not allowed".to_string());
-        }
-
+        // For write: ensure parent dirs exist first, then canonicalize parent
         if let Some(parent) = file_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return err(format!("Failed to create directory: {e}"));
             }
+        }
+        if let Err(msg) = check_sandbox_path_for_write(&file_path, &agent.working_dir) {
+            return err(msg);
         }
 
         match std::fs::write(&file_path, &params.content) {
@@ -384,8 +427,8 @@ impl McAgentServer {
             None => agent.working_dir.clone(),
         };
 
-        if !dir_path.starts_with(&agent.working_dir) {
-            return err("Path traversal not allowed".to_string());
+        if let Err(msg) = check_sandbox_path(&dir_path, &agent.working_dir) {
+            return err(msg);
         }
 
         match std::fs::read_dir(&dir_path) {
@@ -423,8 +466,8 @@ impl McAgentServer {
             None => agent.working_dir.clone(),
         };
 
-        if !search_path.starts_with(&agent.working_dir) {
-            return err("Path traversal not allowed".to_string());
+        if let Err(msg) = check_sandbox_path(&search_path, &agent.working_dir) {
+            return err(msg);
         }
 
         let mut matches = Vec::new();
@@ -770,6 +813,14 @@ fn search_recursive(dir: &Path, base: &Path, pattern: &str, matches: &mut Vec<St
         let path = entry.path();
         if path.file_name().map_or(false, |n| n.to_string_lossy().starts_with('.')) {
             continue;
+        }
+        // Skip symlinks that resolve outside the sandbox
+        if let Ok(canonical) = path.canonicalize() {
+            if let Ok(canonical_base) = base.canonicalize() {
+                if !canonical.starts_with(&canonical_base) {
+                    continue;
+                }
+            }
         }
         if path.is_dir() {
             search_recursive(&path, base, pattern, matches);
