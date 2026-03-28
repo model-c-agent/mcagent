@@ -130,6 +130,49 @@ fn ok(msg: String) -> Result<CallToolResult, rmcp::ErrorData> {
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(msg)]))
 }
 
+/// Canonicalize `target` and verify it is within `sandbox_root`.
+/// Returns the canonical path on success, or an error string.
+fn check_sandbox_path(
+    target: &std::path::Path,
+    sandbox_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let canonical_root = sandbox_root
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve sandbox root: {e}"))?;
+    let canonical_target = target
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve path '{}': {e}", target.display()))?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err("Path traversal not allowed: resolved path is outside sandbox".to_string());
+    }
+    Ok(canonical_target)
+}
+
+/// For write_file: the target file may not exist yet, so canonicalize
+/// the parent directory instead and verify it is within `sandbox_root`.
+fn check_sandbox_path_for_write(
+    target: &std::path::Path,
+    sandbox_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let canonical_root = sandbox_root
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve sandbox root: {e}"))?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Path has no parent directory".to_string())?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve parent directory '{}': {e}", parent.display()))?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err("Path traversal not allowed: resolved path is outside sandbox".to_string());
+    }
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| "Path has no file name".to_string())?;
+    Ok(canonical_parent.join(file_name))
+}
+
+
 // === Tool implementations ===
 
 #[rmcp::tool_router(vis = "pub(crate)")]
@@ -320,8 +363,8 @@ impl McAgentServer {
         };
 
         let file_path = agent.working_dir.join(&params.path);
-        if !file_path.starts_with(&agent.working_dir) {
-            return err("Path traversal not allowed".to_string());
+        if let Err(msg) = check_sandbox_path(&file_path, &agent.working_dir) {
+            return err(msg);
         }
 
         match std::fs::read_to_string(&file_path) {
@@ -347,14 +390,36 @@ impl McAgentServer {
         };
 
         let file_path = agent.working_dir.join(&params.path);
-        if !file_path.starts_with(&agent.working_dir) {
-            return err("Path traversal not allowed".to_string());
+
+        // Check for path traversal BEFORE creating any directories.
+        // Normalize the path logically (resolve ".." without filesystem access)
+        // so we never create directories outside the sandbox.
+        let canonical_working = match agent.working_dir.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return err(format!("Cannot resolve working directory: {e}")),
+        };
+        let mut normalized = canonical_working.clone();
+        for component in std::path::Path::new(&params.path).components() {
+            match component {
+                std::path::Component::ParentDir => { normalized.pop(); }
+                std::path::Component::Normal(c) => normalized.push(c),
+                std::path::Component::CurDir => {}
+                _ => {}
+            }
+        }
+        if !normalized.starts_with(&canonical_working) {
+            return err("Path traversal not allowed: path escapes sandbox".to_string());
         }
 
+        // Now safe to create parent directories within the sandbox
         if let Some(parent) = file_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return err(format!("Failed to create directory: {e}"));
             }
+        }
+        // Final canonicalized check (catches symlink-based escape after dir creation)
+        if let Err(msg) = check_sandbox_path_for_write(&file_path, &agent.working_dir) {
+            return err(msg);
         }
 
         match std::fs::write(&file_path, &params.content) {
@@ -384,8 +449,8 @@ impl McAgentServer {
             None => agent.working_dir.clone(),
         };
 
-        if !dir_path.starts_with(&agent.working_dir) {
-            return err("Path traversal not allowed".to_string());
+        if let Err(msg) = check_sandbox_path(&dir_path, &agent.working_dir) {
+            return err(msg);
         }
 
         match std::fs::read_dir(&dir_path) {
@@ -423,8 +488,8 @@ impl McAgentServer {
             None => agent.working_dir.clone(),
         };
 
-        if !search_path.starts_with(&agent.working_dir) {
-            return err("Path traversal not allowed".to_string());
+        if let Err(msg) = check_sandbox_path(&search_path, &agent.working_dir) {
+            return err(msg);
         }
 
         let mut matches = Vec::new();
@@ -533,9 +598,7 @@ impl McAgentServer {
             return err("Tool name must be 1-64 characters".to_string());
         }
         if !params.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-            return err(format!(
-                "Tool name contains invalid character; only [a-zA-Z0-9_-] allowed"
-            ));
+            return err("Tool name contains invalid character; only [a-zA-Z0-9_-] allowed".to_string());
         }
 
         let state = self.state.read().await;
@@ -760,15 +823,38 @@ impl McAgentServer {
     }
 }
 
+/// Maximum number of search results to prevent unbounded output.
+const MAX_SEARCH_RESULTS: usize = 1000;
+
 fn search_recursive(dir: &Path, base: &Path, pattern: &str, matches: &mut Vec<String>) {
+    if matches.len() >= MAX_SEARCH_RESULTS {
+        return;
+    }
+
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
 
     for entry in entries.flatten() {
+        if matches.len() >= MAX_SEARCH_RESULTS {
+            return;
+        }
         let path = entry.path();
         if path.file_name().map_or(false, |n| n.to_string_lossy().starts_with('.')) {
+            continue;
+        }
+        // Mandatory sandbox check: skip entries that fail to canonicalize
+        // or resolve outside the sandbox (prevents symlink-based escape)
+        let canonical = match path.canonicalize() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let canonical_base = match base.canonicalize() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if !canonical.starts_with(&canonical_base) {
             continue;
         }
         if path.is_dir() {
@@ -776,6 +862,9 @@ fn search_recursive(dir: &Path, base: &Path, pattern: &str, matches: &mut Vec<St
         } else if path.is_file() {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 for (i, line) in content.lines().enumerate() {
+                    if matches.len() >= MAX_SEARCH_RESULTS {
+                        return;
+                    }
                     if line.contains(pattern) {
                         let rel = path.strip_prefix(base).unwrap_or(&path);
                         matches.push(format!("{}:{}: {}", rel.display(), i + 1, line));
