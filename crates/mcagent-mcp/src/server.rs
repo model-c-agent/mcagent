@@ -78,16 +78,18 @@ impl ServerState {
     }
 
     pub fn get_agent(&self, agent_id: &str) -> Result<&Agent, McAgentError> {
+        let parsed_id: AgentId = agent_id.parse()?;
         self.agents
             .get(agent_id)
-            .ok_or_else(|| McAgentError::AgentNotFound(agent_id.parse().unwrap()))
+            .ok_or(McAgentError::AgentNotFound(parsed_id))
     }
 
     pub async fn destroy_agent(&mut self, agent_id: &str) -> Result<(), McAgentError> {
+        let parsed_id: AgentId = agent_id.parse()?;
         let handle = self
             .handles
             .remove(agent_id)
-            .ok_or_else(|| McAgentError::AgentNotFound(agent_id.parse().unwrap()))?;
+            .ok_or(McAgentError::AgentNotFound(parsed_id))?;
         self.agents.remove(agent_id);
         self.budgets.remove(agent_id);
         self.budget_usage.remove(agent_id);
@@ -100,6 +102,7 @@ impl ServerState {
             self.budgets.get(agent_id),
             self.budget_usage.get(agent_id),
         ) {
+            let parsed_id: AgentId = agent_id.parse()?;
             let status = mcagent_core::check_budget(budget, usage);
             if let mcagent_core::BudgetStatus::Exceeded {
                 dimension,
@@ -108,7 +111,7 @@ impl ServerState {
             } = status
             {
                 return Err(McAgentError::BudgetExceeded {
-                    agent_id: agent_id.parse().unwrap(),
+                    agent_id: parsed_id,
                     dimension,
                     limit,
                     used: actual,
