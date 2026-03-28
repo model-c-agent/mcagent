@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Budget constraints for an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +59,25 @@ pub enum BudgetStatus {
     WithinBudget { usage_percent: f64 },
     Warning { usage_percent: f64, dimension: String },
     Exceeded { dimension: String, limit: f64, actual: f64 },
+}
+
+impl fmt::Display for BudgetStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WithinBudget { usage_percent } => {
+                write!(f, "within budget ({usage_percent:.1}% used)")
+            }
+            Self::Warning {
+                usage_percent,
+                dimension,
+            } => write!(f, "warning: {dimension} at {usage_percent:.1}%"),
+            Self::Exceeded {
+                dimension,
+                limit,
+                actual,
+            } => write!(f, "exceeded: {dimension} (limit={limit}, used={actual})"),
+        }
+    }
 }
 
 /// Check budget against usage. Returns the most critical status.

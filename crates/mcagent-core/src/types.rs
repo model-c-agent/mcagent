@@ -3,6 +3,34 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 use uuid::Uuid;
+use crate::McAgentError;
+
+/// Maximum length for agent/task identifiers.
+const MAX_ID_LEN: usize = 64;
+
+/// Validate an identifier string for use as AgentId or TaskId.
+/// Allowed characters: ASCII alphanumeric, underscore, hyphen.
+/// Must be 1..=64 characters.
+fn validate_id(s: &str, kind: &str) -> Result<(), McAgentError> {
+    if s.is_empty() {
+        return Err(McAgentError::InvalidAgentId(
+            format!("{kind} must not be empty"),
+        ));
+    }
+    if s.len() > MAX_ID_LEN {
+        return Err(McAgentError::InvalidAgentId(
+            format!("{kind} exceeds maximum length of {MAX_ID_LEN} characters"),
+        ));
+    }
+    for ch in s.chars() {
+        if !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+            return Err(McAgentError::InvalidAgentId(
+                format!("{kind} contains invalid character: '{ch}'"),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Unique identifier for an agent.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -31,8 +59,9 @@ impl fmt::Display for AgentId {
 }
 
 impl FromStr for AgentId {
-    type Err = std::convert::Infallible;
+    type Err = McAgentError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        validate_id(s, "AgentId")?;
         Ok(Self(s.to_string()))
     }
 }
@@ -64,8 +93,9 @@ impl fmt::Display for TaskId {
 }
 
 impl FromStr for TaskId {
-    type Err = std::convert::Infallible;
+    type Err = McAgentError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        validate_id(s, "TaskId")?;
         Ok(Self(s.to_string()))
     }
 }

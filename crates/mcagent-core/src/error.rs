@@ -45,6 +45,9 @@ pub enum McAgentError {
     #[error("docker error: {0}")]
     Docker(String),
 
+    #[error("invalid agent/task ID: {0}")]
+    InvalidAgentId(String),
+
     #[error("{0}")]
     Other(String),
 }
