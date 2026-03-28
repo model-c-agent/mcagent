@@ -468,7 +468,28 @@ impl McAgentServer {
         Parameters(params): Parameters<CompileToolParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let state = self.state.read().await;
-        match state.wasi_runner.compile_tool(std::path::Path::new(&params.source_path)) {
+
+        // Restrict source_path to files within .mcagent/tools/
+        let tools_dir = state.project_root.join(".mcagent").join("tools");
+        let source = std::path::Path::new(&params.source_path);
+
+        let canon_tools = match std::fs::canonicalize(&tools_dir) {
+            Ok(p) => p,
+            Err(_) => return err("Tools directory does not exist. Run workspace_init first.".to_string()),
+        };
+        let canon_source = match std::fs::canonicalize(source) {
+            Ok(p) => p,
+            Err(_) => return err(format!(
+                "Source path '{}' does not exist or cannot be resolved",
+                params.source_path
+            )),
+        };
+
+        if !canon_source.starts_with(&canon_tools) {
+            return err(format!("Source path must be within .mcagent/tools/; got '{}'", params.source_path));
+        }
+
+        match state.wasi_runner.compile_tool(&canon_source) {
             Ok(wasm_path) => ok(format!("Compiled to {}", wasm_path.display())),
             Err(e) => err(format!("{e}")),
         }
@@ -507,6 +528,16 @@ impl McAgentServer {
         &self,
         Parameters(params): Parameters<CreateToolParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Validate tool name: must be 1-64 chars, [a-zA-Z0-9_-] only
+        if params.name.is_empty() || params.name.len() > 64 {
+            return err("Tool name must be 1-64 characters".to_string());
+        }
+        if !params.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return err(format!(
+                "Tool name contains invalid character; only [a-zA-Z0-9_-] allowed"
+            ));
+        }
+
         let state = self.state.read().await;
         match state.wasi_runner.create_tool(&params.name, &params.source) {
             Ok(source_path) => ok(format!("Tool '{}' created and compiled: {}", params.name, source_path.display())),
