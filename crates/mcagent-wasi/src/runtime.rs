@@ -73,6 +73,16 @@ impl WasiToolRunner {
         working_dir: &Path,
         args: &[String],
     ) -> Result<ToolOutput, McAgentError> {
+        // Validate tool_name: only allow [a-zA-Z0-9_-] to prevent path traversal
+        if tool_name.is_empty()
+            || tool_name.len() > 64
+            || !tool_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(McAgentError::ToolNotFound(tool_name.to_string()));
+        }
+
         let source_path = self.tools_dir.join(format!("{tool_name}.rs"));
         if !source_path.exists() {
             return Err(McAgentError::ToolNotFound(tool_name.to_string()));
